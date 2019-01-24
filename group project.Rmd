@@ -1,0 +1,367 @@
+---
+title: "Group Project"
+author: "Jason Su, Kemei Zhuo, Won Lee"
+date: "December 11, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## 0. Data preprocessing(From the "Data Preprocessing.R")
+
+```{r message=FALSE, warning=FALSE}
+library(xgboost)
+library(Matrix)
+library(tidyverse)
+library(reshape2)
+library(cluster) 
+library(glmnet)
+library(fpp2)
+library(caret)
+
+D <- read_csv("PB Sales.csv")
+U <- read.csv("PB Product Information.csv")
+S<- read_table("Delivery_Stores")
+MSF <-read_csv("PBMSF.csv")
+H <- read_csv("PB Sales Plan.csv")
+S <- S %>%
+  select(IRI_KEY, Market_Name, EST_ACV) 
+D <- D %>% 
+  mutate(PPU = DOLLARS / UNITS) %>%
+  bind_rows(H) %>%
+  left_join(S) %>%
+  filter(Market_Name == "CHICAGO")
+D <- D %>% 
+  group_by(UPC, IRI_KEY) %>%
+  arrange(WEEK) %>%
+  mutate(UNITS.L1 = lag(UNITS)) %>%
+  fill(UNITS.L1) %>%
+  mutate(UNITS.L1 = log(UNITS.L1)) %>%
+  ungroup()
+D <- D %>% 
+  group_by(UPC, IRI_KEY) %>%
+  mutate(AVG.UNITS = log(mean(UNITS, na.rm = TRUE))) %>%
+  ungroup()
+US <- U %>% select(UPC, VOL_EQ, TYPE, TEXTURE, FLAVOR)
+D <- D %>% 
+  left_join(US) %>%
+  mutate(PPOZ = (PPU / (VOL_EQ * 16)))
+DF <- D %>%
+  filter(VEND    <=  99990,
+         TEXTURE == "CREAMY",
+         FLAVOR  == "REGULAR",
+         VOL_EQ  >=  0.25)
+DK <- DF %>%
+  group_by(UPC) %>%
+  mutate(AVG.SALES = mean(UNITS, na.rm = TRUE)) %>%
+  summarize(AVG.SALES = max(AVG.SALES),
+            PKG.SIZE  = max(VOL_EQ),
+            AVG.PPOZ  = mean(PPOZ)) %>%
+  na.omit() 
+
+set.seed(1)
+
+k <- kmeans(DK[,-1], centers=5, nstart=30)
+
+DK <- DK %>%
+  mutate(CLUSTER = k$cluster) %>%
+  select(UPC, CLUSTER)
+DF <- DF %>%
+  left_join(DK) %>%
+  mutate(CLUSTER = as.factor(CLUSTER))
+```
+
+## 1. Project Description
+
+### (1) Forecasting approach
+
+In this project, we will use the Gradient Tree Boosting to forecast the unit sales for each of the SKU-Store-Week combination, for the specific "Skippy" brand products and make stocking decision based on our forecast. The variables come from various data files and the above data preprocessing has combined the valuable variables and created a dataframe for modeling.
+
+### (2) Model characteristics
+
+For the Gradient Tree Boosting, there are multiple parameters and we use cross validation to get the optimal parameters set for our forecast data. The parameters include:
+
+* Learning_rate The contribution of each tree
+* lambda The L2 regularizaiont term on weights
+* max_depth Maximum depth of a tree
+* subsample The random fraction of rows that are sampled at every iteration
+* colsample_bytree Random fraction of variables that are used at each iteration
+* colsample_bylevel Random fraction of variables that are used at each level of each iteration
+* nround Max number of boosting iterations
+
+### (3) Used predictive variables
+
+This project collects and uses variables from the data files to forecast the unit sales. We exclude some variables in the original data files becuase they are not available for forecasting the future unit sales. In addition, we remove some replicated variables, such as SY and GE, which can be represented by UPC. The used variables include:
+
+* IRI_KEY	The masked store number, which is unique for each point of sale
+* UPC	The product’s universal product code (bar code)
+*	VOL_EQ	Weight in pounds of a units sold
+*	PPU	Price per unit ($/lb). As it is included in the sales plan, we assume it is the estimated price and therefore     can be used for forecasting the unit sale
+*	F	Factor specifying advertising in the store weekly flyer:  
+    + F = “A”	Large size ad.
+    + F = “B”	Medium size ad.
+    + F = “C”	Small size ad.
+*	D	Factor specifying In-Store Display
+    + D = 0	No In-Store Display
+    + D = 1	Minor In-Store Display
+    + D = 2	Major In-Store Display
+* Texture The texture of the peanut butter
+* Flavor The flavor of the peanut butter
+* Type The type of the penut
+* PR The Price Reduction flag
+     + PR = 1	TPR is 5% or greater
+     + PR = 0	otherwise
+* AVG.UNITS The average unit sales for each combination of UPC and IRI_KEY
+* PPOZ Price per pound.
+* Cluser Five different clusters created by k-mean, based on all other variables in DK dataframe.
+
+```{r }
+DT <- DF
+DT$Market_Name <- NULL
+DT$L.UNITS <- log(DT$UNITS)
+DT$UNITS.L1 <- NULL
+DT$SY<-NULL
+DT$GE<-NULL
+DT$VEND<-NULL
+DT$ITEM<-NULL
+DT$DOLLARS<- NULL
+DT$UNITS <- NULL
+
+options(na.action = "na.pass")
+DTM <-model.matrix(L.UNITS ~ ., data = DT)[,-1]
+
+D.TR <- DTM[DTM[,"WEEK"] <= 1663,]
+D.TE <- DTM[(DTM[,"WEEK"] >= 1664) & (DTM[,"WEEK"] <= 1673),]
+D.H  <- DTM[DTM[,"WEEK"] <= 1673,]
+D.FC <- DTM[DTM[,"WEEK"] >= 1674,]
+
+y.tr <- DT %>% 
+  filter(WEEK <= 1663) %>%
+  pull(L.UNITS)
+y.te <- DT %>% 
+  filter(WEEK >= 1664 & WEEK <= 1673) %>%
+  pull(L.UNITS)
+y.h <- DT %>% 
+  filter(WEEK <= 1673) %>%
+  pull(L.UNITS)
+
+set.seed(1)
+
+xb <- xgboost(D.TR, y.tr,
+              learning_rate = .25,
+              lambda = 2.35,
+              alpha = 3.5,
+              max_depth = 4, #35
+              subsample = 0.9, # .9
+              colsample_bytree = 0.9,
+              colsample_bylevel = 0.9,
+              nround= 40)
+
+predicted.TE=exp(predict(xb, D.TE))
+predicted.TR=exp(predict(xb, D.TR))
+
+accuracy(exp(y.tr),predicted.TR)
+accuracy(exp(y.te),predicted.TE)
+```
+
+## 2. Forecast of each of the SKU-Store-Week Combination
+
+After getting the optimal parameters, combined the test data and trainning data as the full data to train the final model. And use the final model to predict the unit sales for the next 10 weeks after the end of sales history. The forecast will be outputed as an expanded version of the sales plan called "expanded_sales_plan.csv".
+
+```{r }
+#### IMPORTANT: This is where we train on the whole data and make the prediction for the forecast dataframe
+# Train model based on whole data.
+xb <- xgboost(D.H, y.h,
+              learning_rate = .25,
+              lambda = 2.35,
+              alpha = 3.5,
+              max_depth = 4, #35
+              subsample = 0.9, # .9
+              colsample_bytree = 0.9,
+              colsample_bylevel = 0.9,
+              nround= 40)
+
+predicted.H = exp(predict(xb, D.H))
+accuracy(exp(y.h),predicted.H)
+
+# Create forecast dataframe and then create new column
+forecasted <- as.data.frame(D.FC)
+forecasted$UNITS_FORECAST <- exp(predict(xb, D.FC))
+
+# write.csv(forecasted,'expanded_sales_plan.csv')
+#####################
+```
+
+## 3. An aggregate forecast for the "Skippy" brand products
+
+The forecast will be outputed as an expanded version of the sales plan called "skippy_forecast.csv".
+
+```{r message=FALSE, warning=FALSE}
+D <- read_csv("PB Sales.csv")
+U <- read.csv("PB Product Information.csv")
+S<- read_table("Delivery_Stores")
+MSF <-read_csv("PBMSF.csv")
+H <- read_csv("PB Sales Plan.csv")
+
+U <- U[U$L5=='SKIPPY',]
+vendors <- unique(U$VEND)
+
+S <- S %>%
+  select(IRI_KEY, Market_Name, EST_ACV) 
+D_skippy <- D %>% 
+  mutate(PPU = DOLLARS / UNITS) %>%
+  bind_rows(H) %>%
+  left_join(S) %>%
+  filter(Market_Name == "CHICAGO") %>%
+  filter(VEND %in% vendors)
+D_skippy <- D_skippy %>% 
+  group_by(UPC, IRI_KEY) %>%
+  arrange(WEEK) %>%
+  mutate(UNITS.L1 = lag(UNITS)) %>%
+  fill(UNITS.L1) %>%
+  mutate(UNITS.L1 = log(UNITS.L1)) %>%
+  ungroup()
+D_skippy <- D_skippy %>% 
+  group_by(UPC, IRI_KEY) %>%
+  mutate(AVG.UNITS = log(mean(UNITS, na.rm = TRUE))) %>%
+  ungroup()
+US <- U %>% select(UPC, VOL_EQ, TYPE, TEXTURE, FLAVOR)
+D_skippy <- D_skippy %>% 
+  left_join(US) %>%
+  mutate(PPOZ = (PPU / (VOL_EQ * 16)))
+DF_skippy <- D_skippy %>%
+  filter(VEND    <=  99990,
+         TEXTURE == "CREAMY",
+         FLAVOR  == "REGULAR",
+         VOL_EQ  >=  0.25)
+DK_skippy <- DF_skippy %>%
+  group_by(UPC) %>%
+  mutate(AVG.SALES = mean(UNITS, na.rm = TRUE)) %>%
+  summarize(AVG.SALES = max(AVG.SALES),
+            PKG.SIZE  = max(VOL_EQ),
+            AVG.PPOZ  = mean(PPOZ)) %>%
+  na.omit() 
+
+k <- kmeans(DK_skippy[,-1], centers=5, nstart=30)
+
+DK_skippy <- DK_skippy %>%
+  mutate(CLUSTER = k$cluster) %>%
+  select(UPC, CLUSTER)
+DF_skippy <- DF_skippy %>%
+  left_join(DK_skippy) %>%
+  mutate(CLUSTER = as.factor(CLUSTER))
+
+DT_skippy <- DF_skippy
+DT_skippy$Market_Name <- NULL
+DT_skippy$L.UNITS <- log(DT_skippy$UNITS)
+DT_skippy$SY<-NULL
+DT_skippy$GE-NULL
+DT_skippy$VEND<-NULL
+DT_skippy$ITEM<-NULL
+DT_skippy$DOLLARS<- NULL
+DT_skippy$UNITS <- NULL
+
+options(na.action = "na.pass")
+DTM_skippy <-model.matrix(L.UNITS ~ ., data = DT_skippy)[,-1]
+
+D.TR_skippy <- DTM_skippy[DTM_skippy[,"WEEK"] <= 1663,]
+D.TE_skippy <- DTM_skippy[(DTM_skippy[,"WEEK"] >= 1664) & (DTM_skippy[,"WEEK"] <= 1673),]
+D.H_skippy  <- DTM_skippy[DTM_skippy[,"WEEK"] <= 1673,]
+D.FC_skippy <- DTM_skippy[DTM_skippy[,"WEEK"] >= 1674,]
+
+y.tr_skippy <- DT_skippy %>% 
+  filter(WEEK <= 1663) %>%
+  pull(L.UNITS)
+y.te_skippy <- DT_skippy %>% 
+  filter(WEEK >= 1664 & WEEK <= 1673) %>%
+  pull(L.UNITS)
+y.h_skippy <- DT_skippy %>% 
+  filter(WEEK <= 1673) %>%
+  pull(L.UNITS)
+
+#
+# Fit a model with XGBoosting
+#
+set.seed(1)
+
+xb_skippy <- xgboost(D.TR_skippy, y.tr_skippy,
+              learning_rate = .15,
+              lambda = 4,
+              alpha = 3,
+              max_depth = 1, #35 Higher max depth has MAPE jump around due to lower number of observation.
+              # We need to keep it small which stabilize how xb trains.
+              subsample = 0.9, # .9
+              colsample_bytree = 0.9,
+              colsample_bylevel = 0.9,
+              nround= 50)
+
+accuracy(exp(y.tr_skippy),exp(predict(xb_skippy, D.TR_skippy)))
+accuracy(exp(y.te_skippy),exp(predict(xb_skippy, D.TE_skippy)))
+
+#### IMPORTANT: This is where we train on the whole data and make the prediction for the forecast dataframe
+# Train model based on whole data.
+xb <- xgboost(D.H_skippy, y.h_skippy,
+              learning_rate = .25,
+              lambda = 2.35,
+              alpha = 3.5,
+              max_depth = 8, #35
+              subsample = 0.9, # .9
+              colsample_bytree = 0.9,
+              colsample_bylevel = 0.9,
+              nround= 35)
+
+accuracy(exp(y.h_skippy),exp(predict(xb, D.H_skippy)))
+
+# Create forecast dataframe and then create new column
+forecasted_skippy <- as.data.frame(D.FC_skippy)
+forecasted_skippy$UNITS_FORECAST <- exp(predict(xb_skippy, D.FC_skippy))
+
+# write.csv(forecasted_skippy,'skippy_forecast.csv')
+#####################
+```
+
+## 4. Stocking decision
+
+```{r }
+
+rmse = RMSE(y.te,predicted.TE)
+std = sqrt(exp(rmse^2)-1)
+
+get_cost = function(difference,ppu){
+  if (difference>0){
+    return(difference*0.1*ppu)
+  }
+  else{
+    return(-difference*0.2*ppu)
+  }
+}
+
+D4.H = as.data.frame(D.H)
+D4.H$forecast = predicted.H
+D4.H$STDerror = D4.H$forecast*std
+D4.H$UNITS = DF[DF[,'WEEK']<=1673,"UNITS"]
+
+a=seq(0,1,by=0.1)
+for(j in a){
+  k=j
+
+  D4.H$Inventory_Turnover = round(D4.H$forecast + k*D4.H$STDerror)
+  D4.H$difference = D4.H$Inventory_Turnover- D4.H$UNITS
+
+  D4.H$cost = rep(0,nrow(D4.H))
+
+  for(i in 1:nrow(D4.H)){
+    D4.H[i,'cost'] = get_cost(D4.H[i,'difference'],D4.H[i,'PPU'])
+  }
+  p=paste("Sum cost for",k,"is",sum(D4.H$cost))
+  print(p)
+}
+
+k=0.42
+
+forecasted$STDerror = forecasted$UNITS_FORECAST*std
+forecasted$Inventory_Turnover = round(forecasted$UNITS_FORECAST + k*forecasted$STDerror)
+forecasted4 = forecasted[,c(1,2,9:59,130,132)]
+
+#write.csv(forecasted_skippy,'skippy_forecast.csv')
+```
